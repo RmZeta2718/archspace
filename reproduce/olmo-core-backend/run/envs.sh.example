@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+
+# Copy this file to envs.sh and replace the placeholders with paths available
+# on every node. envs.sh is ignored by Git because it is machine-specific.
+
+# Root containing every relative path referenced by OLMo-core's built-in OLMo 3
+# stage-1, stage-2, stage-3, and perplexity-validation data-mix manifests.
+olmo3_data_root=/path/to/olmo3-data
+
+# Checkpoints, trainer artifacts, W&B files, and dataset caches are written here.
+# Use shared, persistent storage for multi-node training and resume.
+out_root=/path/to/training-output
+
+# Local Dolma 2 tokenizer JSON used by the in-loop downstream evaluator. The LM
+# dataset tokenizer metadata still comes from TokenizerConfig.dolma2().
+tokenizer_json=/path/to/tokenizer.json
+
+# W&B destination. Offline mode is the safe default and does not need an API key.
+wandb_entity=YOUR_ENTITY
+wandb_project=YOUR_PROJECT
+export WANDB_MODE=${WANDB_MODE:-offline}
+
+# For online logging, export the secret in the calling shell; do not put it here.
+# export WANDB_API_KEY=YOUR_SECRET

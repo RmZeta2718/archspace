@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Machine-local OLMo reproduction settings (paths and optional credentials).
+/reproduce/olmo-core-backend/run/envs.sh
