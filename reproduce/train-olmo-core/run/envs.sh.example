@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+# Copy this file to envs.sh and replace the placeholders with paths available on every node.
+# envs.sh is intentionally ignored by Git because it contains machine-specific configuration.
+
+# Local paths used to construct training arguments. These variables do not need to be exported.
+# This root contains the stage 1-3 data trees and validation tree referenced by the built-in
+# OLMo 3 data-mix manifests, plus the stage 4/5 SFT directories documented in README.md.
+olmo3_data_root=/path/to/olmo3-data
+out_root=/path/to/training-output
+# Used only by the downstream evaluator; LM eval data is resolved under olmo3_data_root.
+tokenizer_json=/path/to/tokenizer.json
+
+# W&B destination. The launcher defaults to online mode unless WANDB_MODE is set to offline.
+wandb_entity=YOUR_ENTITY
+wandb_project=YOUR_PROJECT
+export WANDB_MODE=offline
+
+# For online logging
+# export WANDB_API_KEY=YOUR_SECRET
+
+# Optional cluster setup. Uncomment and adapt only what this machine needs.
+# export CUDA_HOME=/path/to/cuda
+# export PATH=${CUDA_HOME}/bin:${PATH}
+# export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}

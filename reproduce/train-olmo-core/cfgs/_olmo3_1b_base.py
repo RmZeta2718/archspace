@@ -1,4 +1,4 @@
-"""Shared configuration for the OLMo 3 1B training stages."""
+"""Shared base configuration for the OLMo 3 1B training stages."""
 
 import argparse
 
@@ -13,7 +13,6 @@ from olmo_core.data import (
 )
 from olmo_core.distributed.parallel import DataParallelType
 from olmo_core.eval.task_groups import FAST_TASKS
-from olmo_core.float8 import Float8Config
 from olmo_core.nn.attention import AttentionBackendName
 from olmo_core.nn.transformer import TransformerConfig
 from olmo_core.optim import (
@@ -24,7 +23,7 @@ from olmo_core.optim import (
     SkipStepAdamWConfig,
 )
 from olmo_core.script_utils import ExperimentConfig, get_cli_parser
-from olmo_core.train import Duration, TrainerConfig
+from olmo_core.train import Duration, LoadStrategy, TrainerConfig
 from olmo_core.train.callbacks import (
     CheckpointerCallback,
     CometCallback,
@@ -40,14 +39,13 @@ from olmo_core.train.train_module import (
     TransformerTrainModuleConfig,
 )
 
-DEFAULT_SEQUENCE_LENGTH = 4096
-GLOBAL_BATCH_SIZE = 2**21  # 2M tokens
-SEED = 34521
-EVAL_LM_STEPS = 500  # 500 steps (~1B token) for 150B data, 2500 steps (~5B token) for 6T data.
-EVAL_DOWN_STEPS = 12500  # 12.5K steps (25B tokens) for 150B data
-# Keep the current Muon recipe and the official OLMo 3 AdamW recipe independent.
-MUON_LR = 1e-3
-ADAM_LR = 1e-3
+# Shared local data-loader policy for all five stages.
+seed = 34_521
+num_workers = 8
+prefetch_factor = 4
+
+EVAL_LM_STEPS = 500
+EVAL_DOWN_STEPS = 12500
 
 
 def get_olmo3_1b_cli_parser() -> argparse.ArgumentParser:
@@ -62,32 +60,63 @@ def get_olmo3_1b_cli_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_short_context_model(tokenizer: TokenizerConfig) -> TransformerConfig:
+    """Build the complete short-context model used by pretraining and midtraining."""
+    return TransformerConfig.olmo3_1B(
+        vocab_size=tokenizer.padded_vocab_size(),  # pad to a multiple of 128
+        attn_backend=AttentionBackendName.flash_3,
+    )
+
+
 def build_optim_config(
     name: str,
     *,
-    muon_lr: float,
-    adam_lr: float,
+    lr: float,
 ) -> OptimConfig:
-    """Build the selected optimizer with its stage-specific learning rate."""
+    """Build the pipeline-wide optimizer with the stage learning rate."""
+    # All five stages use this local profile so adjacent checkpoints have compatible optimizer
+    # types and parameter groups. Published OLMo 3 pre/mid/long runs use SkipStep AdamW with
+    # weight decay 0.1, while published SFT uses weight decay 0. This pipeline instead uses 0.033
+    # for both Muon and AdamW; the AdamW embedding group remains exempt from weight decay.
+    # Both branches inherit optim.compile=False: Muon does not support optimizer-step compilation,
+    # and the published OLMo 3 AdamW recipes also keep it disabled. Model compilation is separate.
     # Equivalent whole-object CLI override; define `lr` in the shell first:
     # "--train_module.optim={type: muon, lr: ${lr}, weight_decay: 0.033, betas: [0.9, 0.95]}"
     if name == "muon":
         return MuonConfig(
-            lr=muon_lr,
+            lr=lr,
             weight_decay=0.033,
             betas=(0.9, 0.95),
         )
     # Equivalent whole-object CLI override; define `lr` in the shell first:
     # "--train_module.optim={type: skip_step_adamw, lr: ${lr}, weight_decay: 0.033, betas: [0.9, 0.95], group_overrides: [{params: [embeddings.weight], opts: {weight_decay: 0.0}}]}"
     if name == "adam":
-        # Match the official OLMo 3 AdamW recipe, including no decay on embeddings.
         return SkipStepAdamWConfig(
-            lr=adam_lr,
+            lr=lr,
             weight_decay=0.033,
             betas=(0.9, 0.95),
-            group_overrides=[OptimGroupOverride(params=["embeddings.weight"], opts={"weight_decay": 0.0})],
+            group_overrides=[
+                OptimGroupOverride(
+                    params=["embeddings.weight"], opts={"weight_decay": 0.0}
+                )
+            ],
         )
     raise ValueError(f"Unknown optimizer '{name}'")
+
+
+def get_ephemeral_save_interval(global_batch_size: int) -> int:
+    """Derive a ten-step-aligned checkpoint interval of approximately one Gi tokens."""
+    return round(2**30 / global_batch_size / 10) * 10
+
+
+def configure_stage_continuation(trainer: TrainerConfig) -> None:
+    """Configure checkpoint loading for a stage that continues from its parent."""
+    # script_utils.main first probes save_folder, where these flags require a full same-stage
+    # trainer+optimizer resume. If none exists, ExperimentConfig.load_path loads the parent while
+    # explicitly skipping trainer state; optimizer state is retained through load_optim_state=True.
+    trainer.load_strategy = LoadStrategy.always
+    trainer.load_trainer_state = True
+    trainer.load_optim_state = True
 
 
 def build_common_config(
@@ -99,8 +128,7 @@ def build_common_config(
     train_module: TransformerTrainModuleConfig,
 ) -> ExperimentConfig:
     """Build an experiment from required stage components and the shared trainer."""
-    # Temporary checkpoint approximately every 1B tokens.
-    ephemeral_save_interval = round(2**30 / data_loader.global_batch_size / 10) * 10
+    ephemeral_save_interval = get_ephemeral_save_interval(data_loader.global_batch_size)
 
     trainer = (
         TrainerConfig(
@@ -115,10 +143,14 @@ def build_common_config(
         .with_callback(
             "checkpointer",
             CheckpointerCallback(
-                save_interval=None,  # Only save the final ckpt
+                save_interval=None,  # No periodic permanent checkpoints; final save remains.
                 ephemeral_save_interval=ephemeral_save_interval,
                 max_checkpoints=1,
+                # Optional local override: skip the initial pre-training checkpoint.
+                # CLI: `--trainer.callbacks.checkpointer.pre_train_checkpoint=false`.
                 # pre_train_checkpoint=False,
+                # Optional local override: force synchronous saves; None auto-selects by backend.
+                # CLI: `--trainer.callbacks.checkpointer.save_async=false`.
                 # save_async=False,
             ),
         )
@@ -147,42 +179,47 @@ def build_common_config(
         data_loader=data_loader,
         train_module=train_module,
         trainer=trainer,
+        init_seed=seed,
     )
 
 
-def build_pretrain_config(opts: argparse.Namespace) -> ExperimentConfig:
-    """Build the OLMo 3 1B stage-1 pretraining configuration."""
-    sequence_length = opts.sequence_length or DEFAULT_SEQUENCE_LENGTH
+def build_pretrain_config(
+    opts: argparse.Namespace,
+    *,
+    lr: float,
+    sequence_length: int,
+    rank_microbatch_size: int,
+    global_batch_size: int,
+) -> ExperimentConfig:
+    """Build the short-context baseline inherited by midtraining."""
+    sequence_length = opts.sequence_length or sequence_length
     tokenizer = TokenizerConfig.dolma2()
 
-    model = TransformerConfig.olmo3_1B(
-        vocab_size=tokenizer.padded_vocab_size(),  # pad to a multiple of 128
-        attn_backend=AttentionBackendName.flash_3,
-    )
+    model = build_short_context_model(tokenizer)
 
+    # Plain FSL concatenates token arrays into fixed contiguous windows; documents may be split,
+    # and it consumes neither packed-document boundaries nor assistant-label-mask sidecars.
     dataset = NumpyFSLDatasetConfig.from_data_mix(
         DataMix.OLMo_mix_0625_150Bsample,
         tokenizer=tokenizer,
         mix_base_dir=opts.data_root,
         sequence_length=sequence_length,
-        max_target_sequence_length=max(8192, sequence_length),
         work_dir=opts.work_dir,
     )
 
     data_loader = NumpyDataLoaderConfig(
-        global_batch_size=GLOBAL_BATCH_SIZE,
-        seed=SEED,
-        num_workers=8,
-        prefetch_factor=2,
+        global_batch_size=global_batch_size,
+        seed=seed,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
     )
 
     train_module = TransformerTrainModuleConfig(
-        rank_microbatch_size=4 * DEFAULT_SEQUENCE_LENGTH,
+        rank_microbatch_size=rank_microbatch_size,
         max_sequence_length=sequence_length,
         optim=build_optim_config(
             opts.optim,
-            muon_lr=MUON_LR,
-            adam_lr=ADAM_LR,
+            lr=lr,
         ),
         scheduler=CosWithWarmup(warmup_steps=2000),
         compile_model=True,
@@ -192,7 +229,7 @@ def build_pretrain_config(opts: argparse.Namespace) -> ExperimentConfig:
             reduce_dtype=DType.float32,
             wrapping_strategy=TransformerDataParallelWrappingStrategy.blocks,
         ),
-        float8_config=Float8Config(enabled=False),
+        float8_config=None,
         z_loss_multiplier=1e-5,
         max_grad_norm=1.0,
     )
@@ -209,13 +246,12 @@ def build_pretrain_config(opts: argparse.Namespace) -> ExperimentConfig:
         LMEvaluatorCallbackConfig(
             eval_dataset=NumpyPaddedFSLDatasetConfig.from_data_mix(
                 DataMix.v3_small_ppl_validation,
+                tokenizer=tokenizer,
                 mix_base_dir=opts.data_root,
                 sequence_length=sequence_length,
-                tokenizer=tokenizer,
                 work_dir=opts.work_dir,
             ),
             eval_interval=EVAL_LM_STEPS,
-            # eval_interval=50,
         ),
     ).with_callback(
         "downstream_evaluator",
@@ -223,8 +259,6 @@ def build_pretrain_config(opts: argparse.Namespace) -> ExperimentConfig:
             tasks=sorted(FAST_TASKS),
             tokenizer=tokenizer,
             eval_interval=EVAL_DOWN_STEPS,
-            # eval_interval=50,
         ),
     )
-    config.init_seed = SEED
     return config

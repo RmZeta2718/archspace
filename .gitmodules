@@ -1,0 +1,4 @@
+[submodule "reproduce/train-olmo-core/third_party/OLMo-core"]
+	path = reproduce/train-olmo-core/third_party/OLMo-core
+	url = https://github.com/JT-Ushio/OLMo-core-muon-fix.git
+	branch = ready_for_archspace_base
